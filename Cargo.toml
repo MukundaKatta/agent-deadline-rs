@@ -1,0 +1,21 @@
+[package]
+name = "agent-deadline"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cooperative per-task deadline primitive for AI agent workflows."
+keywords = ["llm", "agent", "deadline", "timeout", "async"]
+categories = ["asynchronous", "rust-patterns"]
+repository = "https://github.com/MukundaKatta/agent-deadline-rs"
+readme = "README.md"
+authors = ["Mukunda Rao Katta"]
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
