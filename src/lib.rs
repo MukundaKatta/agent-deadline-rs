@@ -1,307 +1,276 @@
-//! Cooperative per-task deadline primitive for AI agent workflows.
-//!
-//! Agent loops chain LLM and tool calls. Each step has its own network
-//! timeout, but rarely is there a single wall-clock cap on the whole task.
-//! This crate is a small zero-dependency [`Deadline`] type that the loop
-//! checks between steps and hands to downstream calls as their remaining
-//! timeout.
-//!
-//! Cooperative model: code checks the deadline. Nothing is preempted.
-//!
-//! # Example
-//!
-//! ```
-//! use std::time::Duration;
-//! use agent_deadline::Deadline;
-//!
-//! let deadline = Deadline::after(Duration::from_secs(30));
-//!
-//! // Between agent steps, check whether the cap has passed.
-//! deadline.check_or_err().unwrap();
-//!
-//! // Plug the remaining time into per-call timeouts.
-//! let remaining = deadline.remaining();
-//! assert!(remaining <= Duration::from_secs(30));
-//! ```
-//!
-//! # Intersecting nested deadlines
-//!
-//! A sub-step often has its own soft cap that should never exceed the
-//! parent task's remaining time. [`Deadline::intersect`] picks the earlier
-//! of the two.
-//!
-//! ```
-//! use std::time::Duration;
-//! use agent_deadline::Deadline;
-//!
-//! let task = Deadline::after(Duration::from_secs(30));
-//! let retry = Deadline::after(Duration::from_secs(5));
-//!
-//! let tighter = task.intersect(&retry);
-//! assert!(tighter.remaining() <= Duration::from_secs(5));
-//! ```
+/*!
+agent-deadline: cooperative per-task deadline for AI agent runs.
 
-use std::error::Error;
-use std::fmt;
+Check the deadline at loop boundaries. Raise (return Err) when time is up.
+Supports intersecting two deadlines to get the stricter one.
+
+```rust
+use agent_deadline::Deadline;
+
+let d = Deadline::new(3600.0, Some("my_task".to_string()));
+assert!(!d.is_exceeded());
+assert!(d.remaining_secs() > 0.0);
+d.check_or_raise().unwrap();
+```
+*/
+
 use std::time::{Duration, Instant};
 
-/// Internal representation of when a deadline fires.
-///
-/// `Instant` is used because it is monotonic on every supported platform,
-/// so the deadline is unaffected by NTP jumps or wall-clock resets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeadlineAt {
-    At(Instant),
-    Never,
-}
-
-/// A monotonic-time deadline for cooperative task cancellation.
-///
-/// Build one with [`Deadline::after`] (relative) or [`Deadline::at`]
-/// (absolute), then call [`Deadline::check_or_err`] between agent steps
-/// and [`Deadline::remaining`] when handing the timeout to a per-call API.
-///
-/// Deadlines are immutable. To tighten a deadline for a nested operation
-/// without touching the original, use [`Deadline::intersect`].
-#[derive(Debug, Clone, Copy)]
-pub struct Deadline {
-    at: DeadlineAt,
-    /// Captured at build time so `elapsed` keeps measuring against the
-    /// original task start, even after an intersection.
-    created_at: Instant,
-}
-
-impl Deadline {
-    /// Build a deadline that fires `duration` from now.
-    ///
-    /// A `Duration::ZERO` produces an already-expired deadline, which is
-    /// occasionally useful in tests.
-    pub fn after(duration: Duration) -> Self {
-        let now = Instant::now();
-        // `checked_add` returns None on overflow with very large durations.
-        // Treat that as "never" so callers asking for a near-infinite cap
-        // do not get a silently truncated deadline.
-        let at = match now.checked_add(duration) {
-            Some(t) => DeadlineAt::At(t),
-            None => DeadlineAt::Never,
-        };
-        Self { at, created_at: now }
-    }
-
-    /// Build a deadline that fires at an exact monotonic instant.
-    ///
-    /// Use this when you already have an `Instant` from another source
-    /// (for example a parent task's deadline expressed as an `Instant`).
-    pub fn at(instant: Instant) -> Self {
-        Self {
-            at: DeadlineAt::At(instant),
-            created_at: Instant::now(),
-        }
-    }
-
-    /// A deadline that never fires.
-    ///
-    /// Useful as a default for callers that may or may not want a cap.
-    /// [`Self::remaining`] returns `Duration::MAX`, [`Self::expired`] is
-    /// always `false`, and [`Self::check_or_err`] is a no-op.
-    pub fn never() -> Self {
-        Self {
-            at: DeadlineAt::Never,
-            created_at: Instant::now(),
-        }
-    }
-
-    /// `true` if this deadline was built with [`Deadline::never`].
-    pub fn is_never(&self) -> bool {
-        matches!(self.at, DeadlineAt::Never)
-    }
-
-    /// The absolute instant at which this deadline fires, if any.
-    ///
-    /// Returns `None` for [`Deadline::never`].
-    pub fn instant(&self) -> Option<Instant> {
-        match self.at {
-            DeadlineAt::At(i) => Some(i),
-            DeadlineAt::Never => None,
-        }
-    }
-
-    /// `true` once the current monotonic time is at or past the deadline.
-    ///
-    /// Always `false` for [`Deadline::never`].
-    pub fn expired(&self) -> bool {
-        match self.at {
-            DeadlineAt::Never => false,
-            DeadlineAt::At(at) => Instant::now() >= at,
-        }
-    }
-
-    /// Duration left until the deadline. Saturates at zero. Never negative.
-    ///
-    /// Returns [`Duration::MAX`] for [`Deadline::never`]. Hand this to any
-    /// timeout-taking API.
-    pub fn remaining(&self) -> Duration {
-        match self.at {
-            DeadlineAt::Never => Duration::MAX,
-            DeadlineAt::At(at) => at.saturating_duration_since(Instant::now()),
-        }
-    }
-
-    /// Convenience for callers that want the remaining time as `f64` seconds.
-    ///
-    /// Returns `f64::INFINITY` for [`Deadline::never`].
-    pub fn remaining_seconds(&self) -> f64 {
-        match self.at {
-            DeadlineAt::Never => f64::INFINITY,
-            DeadlineAt::At(_) => self.remaining().as_secs_f64(),
-        }
-    }
-
-    /// Seconds since this deadline was constructed.
-    ///
-    /// Survives an [`Self::intersect`]: the elapsed counter still measures
-    /// against the original task start.
-    pub fn elapsed(&self) -> Duration {
-        self.created_at.elapsed()
-    }
-
-    /// Cooperative check: return `Err(DeadlineExceeded)` if the deadline
-    /// has passed.
-    ///
-    /// No-op for [`Deadline::never`]. Call between agent steps.
-    pub fn check_or_err(&self) -> Result<(), DeadlineExceeded> {
-        match self.at {
-            DeadlineAt::Never => Ok(()),
-            DeadlineAt::At(at) => {
-                let now = Instant::now();
-                if now >= at {
-                    Err(DeadlineExceeded {
-                        elapsed: now.saturating_duration_since(self.created_at),
-                    })
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    /// Return a new deadline that fires at the earlier of `self` and `other`.
-    ///
-    /// `created_at` is preserved from `self` so [`Self::elapsed`] keeps
-    /// measuring against the original task start, not the intersection point.
-    pub fn intersect(&self, other: &Deadline) -> Deadline {
-        let tighter = match (self.at, other.at) {
-            (DeadlineAt::Never, other_at) => other_at,
-            (self_at, DeadlineAt::Never) => self_at,
-            (DeadlineAt::At(a), DeadlineAt::At(b)) => DeadlineAt::At(a.min(b)),
-        };
-        Deadline {
-            at: tighter,
-            created_at: self.created_at,
-        }
-    }
-
-    /// Convenience: intersect with a deadline `duration` from now.
-    pub fn intersect_after(&self, duration: Duration) -> Deadline {
-        self.intersect(&Deadline::after(duration))
-    }
-}
-
-impl Default for Deadline {
-    /// Default deadline is [`Deadline::never`]. Useful in struct fields
-    /// where "no cap" is the sane default.
-    fn default() -> Self {
-        Self::never()
-    }
-}
-
-impl PartialEq for Deadline {
-    /// Two deadlines compare equal when they fire at the same instant
-    /// (or both are `never`). `created_at` is not part of identity.
-    fn eq(&self, other: &Self) -> bool {
-        self.at == other.at
-    }
-}
-
-impl Eq for Deadline {}
-
-/// Error returned by [`Deadline::check_or_err`] when the cap has passed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Raised when a deadline has been exceeded.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeadlineExceeded {
-    /// Time since the deadline was created.
-    pub elapsed: Duration,
+    pub elapsed_secs: f64,
+    pub allowed_secs: f64,
+    pub task_id: Option<String>,
 }
 
-impl DeadlineExceeded {
-    /// Elapsed time since the deadline was created, as `f64` seconds.
-    pub fn elapsed_seconds(&self) -> f64 {
-        self.elapsed.as_secs_f64()
-    }
-}
-
-impl fmt::Display for DeadlineExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for DeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "deadline exceeded: elapsed {:.6}s past the configured cap",
-            self.elapsed_seconds()
+            "DeadlineExceeded: elapsed {:.3}s > allowed {:.3}s{}",
+            self.elapsed_secs,
+            self.allowed_secs,
+            self.task_id
+                .as_deref()
+                .map(|id| format!(" (task={})", id))
+                .unwrap_or_default()
         )
     }
 }
 
-impl Error for DeadlineExceeded {}
+impl std::error::Error for DeadlineExceeded {}
 
-// ---- optional serde support ----
-//
-// `Instant` is not portably serializable: it has no fixed reference point
-// across processes. For diagnostic snapshots we serialize the *remaining*
-// duration at the moment of serialization, plus a `never` flag.
-// Round-tripping reconstructs a deadline that fires the same duration from
-// the deserializing process's `now`. This is a snapshot, not a faithful
-// clone, and that is the documented intent.
+/// A cooperative per-task deadline.
+///
+/// Create with `Deadline::new(seconds, task_id)` and call `check_or_raise()`
+/// at loop boundaries. The deadline does NOT cancel work automatically — it
+/// returns `Err(DeadlineExceeded)` so callers can stop voluntarily.
+#[derive(Clone)]
+pub struct Deadline {
+    start: Instant,
+    duration: Duration,
+    pub task_id: Option<String>,
+}
 
-#[cfg(feature = "serde")]
-mod serde_impl {
-    use super::{Deadline, DeadlineAt};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+impl Deadline {
+    /// Create a new deadline that expires `seconds` from now.
+    pub fn new(seconds: f64, task_id: Option<String>) -> Self {
+        Self {
+            start: Instant::now(),
+            duration: Duration::from_secs_f64(seconds.max(0.0)),
+            task_id,
+        }
+    }
+
+    /// Seconds elapsed since this deadline was created.
+    pub fn elapsed_secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    /// Seconds remaining before the deadline expires. Returns 0.0 when exceeded.
+    pub fn remaining_secs(&self) -> f64 {
+        let elapsed = self.start.elapsed();
+        if elapsed >= self.duration {
+            0.0
+        } else {
+            (self.duration - elapsed).as_secs_f64()
+        }
+    }
+
+    /// True when the deadline has been exceeded.
+    pub fn is_exceeded(&self) -> bool {
+        self.start.elapsed() >= self.duration
+    }
+
+    /// Return `Err(DeadlineExceeded)` if the deadline has been exceeded.
+    pub fn check_or_raise(&self) -> Result<(), DeadlineExceeded> {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let allowed = self.duration.as_secs_f64();
+        if elapsed >= allowed {
+            Err(DeadlineExceeded {
+                elapsed_secs: elapsed,
+                allowed_secs: allowed,
+                task_id: self.task_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Return a new deadline whose expiry is the sooner of `self` and `other`.
+    pub fn intersect(&self, other: &Deadline) -> Deadline {
+        let self_remaining = self.remaining_secs();
+        let other_remaining = other.remaining_secs();
+        let task_id = if self_remaining <= other_remaining {
+            self.task_id.clone()
+        } else {
+            other.task_id.clone()
+        };
+        Deadline::new(self_remaining.min(other_remaining), task_id)
+    }
+
+    /// The total allowed duration in seconds.
+    pub fn allowed_secs(&self) -> f64 {
+        self.duration.as_secs_f64()
+    }
+}
+
+impl std::fmt::Debug for Deadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deadline")
+            .field("elapsed_secs", &self.elapsed_secs())
+            .field("remaining_secs", &self.remaining_secs())
+            .field("task_id", &self.task_id)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
     use std::time::Duration;
 
-    #[derive(Serialize, Deserialize)]
-    struct DeadlineSnapshot {
-        never: bool,
-        remaining_secs: f64,
+    #[test]
+    fn new_deadline_not_exceeded() {
+        let d = Deadline::new(3600.0, None);
+        assert!(!d.is_exceeded());
     }
 
-    impl Serialize for Deadline {
-        fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-            // JSON has no `Infinity`, so for the `never` case we just emit
-            // a sentinel `remaining_secs = 0.0` and rely on the `never` flag.
-            let snap = match self.at {
-                DeadlineAt::Never => DeadlineSnapshot {
-                    never: true,
-                    remaining_secs: 0.0,
-                },
-                DeadlineAt::At(_) => DeadlineSnapshot {
-                    never: false,
-                    remaining_secs: self.remaining().as_secs_f64(),
-                },
-            };
-            snap.serialize(ser)
-        }
+    #[test]
+    fn check_or_raise_ok_when_not_exceeded() {
+        let d = Deadline::new(3600.0, None);
+        assert!(d.check_or_raise().is_ok());
     }
 
-    impl<'de> Deserialize<'de> for Deadline {
-        fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-            let snap = DeadlineSnapshot::deserialize(de)?;
-            if snap.never {
-                return Ok(Deadline::never());
-            }
-            let remaining = if snap.remaining_secs.is_finite() && snap.remaining_secs > 0.0 {
-                Duration::from_secs_f64(snap.remaining_secs)
-            } else {
-                Duration::ZERO
-            };
-            Ok(Deadline::after(remaining))
-        }
+    #[test]
+    fn elapsed_increases_over_time() {
+        let d = Deadline::new(3600.0, None);
+        thread::sleep(Duration::from_millis(20));
+        assert!(d.elapsed_secs() > 0.0);
+    }
+
+    #[test]
+    fn remaining_decreases_over_time() {
+        let d = Deadline::new(3600.0, None);
+        let r1 = d.remaining_secs();
+        thread::sleep(Duration::from_millis(20));
+        let r2 = d.remaining_secs();
+        assert!(r1 > r2);
+    }
+
+    #[test]
+    fn exceeded_after_timeout() {
+        let d = Deadline::new(0.01, None);
+        thread::sleep(Duration::from_millis(30));
+        assert!(d.is_exceeded());
+    }
+
+    #[test]
+    fn check_or_raise_err_when_exceeded() {
+        let d = Deadline::new(0.01, Some("test_task".to_string()));
+        thread::sleep(Duration::from_millis(30));
+        let err = d.check_or_raise().unwrap_err();
+        assert_eq!(err.task_id, Some("test_task".to_string()));
+        assert!(err.elapsed_secs > 0.0);
+        assert!(err.allowed_secs < 0.1);
+    }
+
+    #[test]
+    fn remaining_zero_when_exceeded() {
+        let d = Deadline::new(0.01, None);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(d.remaining_secs(), 0.0);
+    }
+
+    #[test]
+    fn task_id_stored() {
+        let d = Deadline::new(3600.0, Some("my_task".to_string()));
+        assert_eq!(d.task_id, Some("my_task".to_string()));
+    }
+
+    #[test]
+    fn no_task_id() {
+        let d = Deadline::new(3600.0, None);
+        assert_eq!(d.task_id, None);
+    }
+
+    #[test]
+    fn zero_second_deadline_immediately_exceeded() {
+        let d = Deadline::new(0.0, None);
+        thread::sleep(Duration::from_millis(5));
+        assert!(d.is_exceeded());
+    }
+
+    #[test]
+    fn negative_seconds_treated_as_zero() {
+        let d = Deadline::new(-1.0, None);
+        thread::sleep(Duration::from_millis(5));
+        assert!(d.is_exceeded());
+    }
+
+    #[test]
+    fn intersect_picks_shorter() {
+        let short = Deadline::new(10.0, Some("short".to_string()));
+        let long = Deadline::new(3600.0, Some("long".to_string()));
+        let intersected = short.intersect(&long);
+        assert!(intersected.remaining_secs() <= 10.1);
+        assert_eq!(intersected.task_id, Some("short".to_string()));
+    }
+
+    #[test]
+    fn intersect_picks_shorter_reversed() {
+        let short = Deadline::new(10.0, Some("short".to_string()));
+        let long = Deadline::new(3600.0, Some("long".to_string()));
+        let intersected = long.intersect(&short);
+        assert!(intersected.remaining_secs() <= 10.1);
+        assert_eq!(intersected.task_id, Some("short".to_string()));
+    }
+
+    #[test]
+    fn intersect_both_exceeded() {
+        let a = Deadline::new(0.01, Some("a".to_string()));
+        let b = Deadline::new(0.01, Some("b".to_string()));
+        thread::sleep(Duration::from_millis(30));
+        let intersected = a.intersect(&b);
+        assert_eq!(intersected.remaining_secs(), 0.0);
+    }
+
+    #[test]
+    fn deadline_exceeded_display() {
+        let err = DeadlineExceeded {
+            elapsed_secs: 1.5,
+            allowed_secs: 1.0,
+            task_id: Some("task1".to_string()),
+        };
+        let s = err.to_string();
+        assert!(s.contains("elapsed 1.500s"));
+        assert!(s.contains("allowed 1.000s"));
+        assert!(s.contains("task1"));
+    }
+
+    #[test]
+    fn deadline_exceeded_no_task_id_display() {
+        let err = DeadlineExceeded {
+            elapsed_secs: 1.0,
+            allowed_secs: 0.5,
+            task_id: None,
+        };
+        let s = err.to_string();
+        assert!(!s.contains("task="));
+    }
+
+    #[test]
+    fn allowed_secs_matches_input() {
+        let d = Deadline::new(42.0, None);
+        assert!((d.allowed_secs() - 42.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn clone_works() {
+        let d = Deadline::new(3600.0, Some("t".to_string()));
+        let d2 = d.clone();
+        assert_eq!(d2.task_id, d.task_id);
     }
 }
