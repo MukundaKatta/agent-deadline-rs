@@ -9,4 +9,11 @@ keywords = ["agent", "deadline", "timeout", "cooperative", "llm"]
 categories = ["asynchronous"]
 exclude = ["target/*", ".github/*", "*.log"]
 
+[features]
+serde = ["dep:serde"]
+
 [dependencies]
+serde = { version = "1", optional = true, default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
