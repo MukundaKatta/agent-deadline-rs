@@ -271,6 +271,42 @@ fn deadline_is_copy() {
     assert_eq!(d.instant(), copied.instant());
 }
 
+// ---------- hash ----------
+
+#[test]
+fn equal_deadlines_have_equal_hashes() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn hash_of(d: &Deadline) -> u64 {
+        let mut h = DefaultHasher::new();
+        d.hash(&mut h);
+        h.finish()
+    }
+
+    let target = Instant::now() + Duration::from_secs(5);
+    // `Eq` ignores creation time, so two deadlines with the same fire instant
+    // must also hash equally (the `Hash`/`Eq` contract).
+    assert_eq!(
+        hash_of(&Deadline::at(target)),
+        hash_of(&Deadline::at(target))
+    );
+    assert_eq!(hash_of(&Deadline::never()), hash_of(&Deadline::never()));
+}
+
+#[test]
+fn deadline_can_be_a_hashset_key() {
+    use std::collections::HashSet;
+    let target = Instant::now() + Duration::from_secs(5);
+    let mut set: HashSet<Deadline> = HashSet::new();
+    set.insert(Deadline::at(target));
+    set.insert(Deadline::at(target)); // same instant: deduplicated
+    set.insert(Deadline::never());
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&Deadline::at(target)));
+    assert!(set.contains(&Deadline::never()));
+}
+
 // ---------- serde (feature-gated) ----------
 
 #[cfg(feature = "serde")]
