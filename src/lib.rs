@@ -27,6 +27,9 @@ assert!(retry.remaining() <= Duration::from_secs(5));
 ```
 */
 
+#![forbid(unsafe_code)]
+
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "serde")]
@@ -206,6 +209,15 @@ impl PartialEq for Deadline {
 
 impl Eq for Deadline {}
 
+impl Hash for Deadline {
+    /// Hashes the deadline instant only, mirroring [`PartialEq`] so that
+    /// `a == b` implies `hash(a) == hash(b)`. This lets `Deadline` be used as
+    /// a key in a `HashMap`/`HashSet`; creation time is ignored.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.at.hash(state);
+    }
+}
+
 #[cfg(feature = "serde")]
 impl Serialize for Deadline {
     /// Serializes the remaining time as a snapshot: `None` for `never`,
@@ -322,5 +334,39 @@ mod tests {
             elapsed: Duration::from_millis(1500),
         };
         assert!(err.to_string().contains("deadline exceeded"));
+    }
+
+    #[test]
+    fn equal_deadlines_hash_equal() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(d: &Deadline) -> u64 {
+            let mut h = DefaultHasher::new();
+            d.hash(&mut h);
+            h.finish()
+        }
+
+        let target = Instant::now() + Duration::from_secs(5);
+        // Equal deadlines (same instant) must hash equally even though they
+        // were created at different times.
+        assert_eq!(
+            hash_of(&Deadline::at(target)),
+            hash_of(&Deadline::at(target))
+        );
+        assert_eq!(hash_of(&Deadline::never()), hash_of(&Deadline::never()));
+    }
+
+    #[test]
+    fn deadline_usable_as_hashset_key() {
+        use std::collections::HashSet;
+        let target = Instant::now() + Duration::from_secs(5);
+        let mut set = HashSet::new();
+        set.insert(Deadline::at(target));
+        set.insert(Deadline::at(target)); // same instant -> deduplicated
+        set.insert(Deadline::never());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&Deadline::at(target)));
+        assert!(set.contains(&Deadline::never()));
     }
 }
